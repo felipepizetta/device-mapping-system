@@ -3,16 +3,23 @@
     <h2>Área da Planta Baixa</h2>
     <div>
       <input type="file" accept=".dxf" @change="handleFileUpload" ref="fileInput" />
+      <select v-model="selectedFloorPlanIndex" @change="selectFloorPlan" :disabled="!uploadedFloorPlans.length">
+        <option v-if="!uploadedFloorPlans.length" disabled value="-1">Nenhuma planta carregada</option>
+        <option v-for="(plan, index) in uploadedFloorPlans" :key="index" :value="index">
+          {{ plan.name }} {{ plan.id ? `(ID: ${plan.id})` : '' }}
+        </option>
+      </select>
       <select v-model="selectedDeviceType">
         <option value="Ponto de Acesso">Ponto de Acesso</option>
         <option value="Switch">Switch</option>
         <option value="Computador">Computador</option>
       </select>
-      <button @click="saveFloorPlan">Salvar Planta Baixa</button>
-      <button @click="loadFloorPlanFromServer">Carregar Planta Baixa</button>
-      <button @click="resetView">Redefinir Visualização</button>
+      <button @click="saveFloorPlan">Salvar</button>
+      <button @click="saveFloorPlanAs">Salvar Como</button>
+      <button @click="showFloorPlanList = true">Listar Plantas Baixas</button>
+      <button @click="resetView">Restaurar Visualização</button>
       <button @click="toggleGrid">{{ showGrid ? 'Ocultar Grade' : 'Exibir Grade' }}</button>
-      <button @click="toggleGridStyle">{{ gridStyle === 'dashed' ? 'Grade Sólida' : 'Grade Tracejada' }}</button>
+      <button @click="toggleGridStyle">{{ gridStyle === 'dashed' ? 'Grade Contínua' : 'Grade Tracejada' }}</button>
       <button @click="exportCanvas">Exportar como PNG</button>
       <label>Tamanho da Grade: 
         <input type="number" v-model.number="baseGridSize" min="10" max="100" step="10" />
@@ -21,8 +28,8 @@
         <input type="color" v-model="gridColor" />
       </label>
     </div>
-    <div v-if="errorMessage" class="error">
-      {{ errorMessage }}
+    <div v-if="statusMessage" class="status" :class="{ error: isError }">
+      {{ statusMessage }}
     </div>
     <div v-if="tooltip" class="tooltip" :style="tooltipStyle">
       {{ tooltip }}
@@ -44,15 +51,49 @@
       <ul>
         <li v-for="(marker, index) in markers" :key="index">
           {{ marker.type }}: {{ marker.name }} (IP: {{ marker.ip }}) em ({{ marker.x.toFixed(2) }}, {{ marker.y.toFixed(2) }})
-          <button @click="removeMarkerByIndex(index)">Remover</button>
+          <button @click="removeMarkerByIndex(index)">Excluir</button>
         </li>
       </ul>
+    </div>
+
+    <!-- Modal para entrada de nome e IP -->
+    <div v-if="showMarkerModal" class="modal">
+      <div class="modal-content">
+        <h3>Adicionar Novo Dispositivo</h3>
+        <label>Nome do Equipamento:
+          <input type="text" v-model="newMarkerName" placeholder="Ex.: AP1" />
+        </label>
+        <label>Endereço IP:
+          <input type="text" v-model="newMarkerIp" placeholder="Ex.: 192.168.1.1" />
+        </label>
+        <div class="modal-actions">
+          <button @click="confirmMarker">Confirmar</button>
+          <button @click="cancelMarker">Cancelar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal para listar plantas baixas salvas -->
+    <div v-if="showFloorPlanList" class="modal">
+      <div class="modal-content">
+        <h3>Selecionar Planta Baixa Salva</h3>
+        <ul v-if="floorPlans.length">
+          <li v-for="planId in floorPlans" :key="planId">
+            Planta Baixa ID: {{ planId }}
+            <button @click="loadFloorPlanById(planId)">Carregar</button>
+          </li>
+        </ul>
+        <p v-else>Nenhuma planta baixa salva disponível.</p>
+        <div class="modal-actions">
+          <button @click="showFloorPlanList = false">Fechar</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script lang="ts">
-import { defineComponent, ref, onMounted, computed } from 'vue'
+import { defineComponent, ref, onMounted, computed, watch } from 'vue'
 import DxfParser from 'dxf-parser'
 
 interface Marker {
@@ -62,6 +103,13 @@ interface Marker {
   color: string
   name: string
   ip: string
+}
+
+interface FloorPlan {
+  id?: string
+  name: string
+  content: string
+  markers: Marker[]
 }
 
 interface Bounds {
@@ -76,9 +124,12 @@ export default defineComponent({
   setup() {
     const canvas = ref<HTMLCanvasElement | null>(null)
     const fileInput = ref<HTMLInputElement | null>(null)
+    const uploadedFloorPlans = ref<FloorPlan[]>([])
+    const selectedFloorPlanIndex = ref(-1)
     const markers = ref<Marker[]>([])
     const selectedDeviceType = ref('Ponto de Acesso')
-    const errorMessage = ref<string | null>(null)
+    const statusMessage = ref<string | null>(null)
+    const isError = ref(false)
     const tooltip = ref<string | null>(null)
     const tooltipX = ref(0)
     const tooltipY = ref(0)
@@ -86,12 +137,18 @@ export default defineComponent({
     const baseGridSize = ref(50)
     const gridColor = ref('#000000')
     const gridStyle = ref<'dashed' | 'solid'>('dashed')
+    const showMarkerModal = ref(false)
+    const newMarkerName = ref('')
+    const newMarkerIp = ref('')
+    const newMarkerX = ref(0)
+    const newMarkerY = ref(0)
+    const showFloorPlanList = ref(false)
+    const floorPlans = ref<string[]>([])
     let ctx: CanvasRenderingContext2D | null = null
     let dxfData: any = null
     let baseScale: number = 1
     let offsetX: number = 0
     let offsetY: number = 0
-    let currentDxfContent: string | null = null
     let zoomLevel: number = 1
     let panOffsetX: number = 0
     let panOffsetY: number = 0
@@ -125,114 +182,235 @@ export default defineComponent({
       pointerEvents: 'none'
     }))
 
-    const handleFileUpload = (event: Event) => {
+    const setStatusMessage = (message: string, error: boolean = false) => {
+      statusMessage.value = message
+      isError.value = error
+      setTimeout(() => {
+        statusMessage.value = null
+        isError.value = false
+      }, 5000)
+    }
+
+    const handleFileUpload = async (event: Event) => {
       const target = event.target as HTMLInputElement
       const file = target.files?.[0]
-      if (!file) return
+      if (!file) {
+        setStatusMessage('Nenhum arquivo selecionado.', true)
+        return
+      }
+      if (!file.name.toLowerCase().endsWith('.dxf')) {
+        setStatusMessage('Por favor, selecione um arquivo .dxf.', true)
+        return
+      }
 
       const reader = new FileReader()
       reader.onload = async (e) => {
         try {
-          currentDxfContent = e.target?.result as string
+          const content = e.target?.result as string
+          if (!content) throw new Error('Conteúdo do arquivo vazio.')
+
           const parser = new DxfParser()
-          dxfData = await parser.parse(currentDxfContent)
-          console.log('Dados DXF Processados:', dxfData)
-          errorMessage.value = null
+          const parsedData = parser.parseSync(content)
+          console.log('Arquivo DXF carregado:', file.name, 'Tamanho:', content.length)
+
+          const newPlan: FloorPlan = { name: file.name, content, markers: [] }
+          uploadedFloorPlans.value = [...uploadedFloorPlans.value, newPlan]
+          selectedFloorPlanIndex.value = uploadedFloorPlans.value.length - 1
+          dxfData = parsedData
+          markers.value = newPlan.markers
+
+          console.log('uploadedFloorPlans:', uploadedFloorPlans.value)
+          console.log('selectedFloorPlanIndex:', selectedFloorPlanIndex.value)
+          setStatusMessage(`Arquivo ${file.name} carregado com sucesso.`)
           resetView()
-          await loadFloorPlan()
+          redrawCanvas()
         } catch (error) {
           console.error('Erro ao processar arquivo .dxf:', error)
-          errorMessage.value = 'Falha ao processar o arquivo .dxf. Verifique o console para detalhes ou assegure-se de que é um arquivo .dxf válido.'
+          setStatusMessage('Falha ao processar o arquivo .dxf. Verifique se o arquivo é válido.', true)
         }
+      }
+      reader.onerror = () => {
+        setStatusMessage('Erro ao ler o arquivo .dxf.', true)
       }
       reader.readAsText(file)
+      if (fileInput.value) fileInput.value = ''
     }
 
-    const loadFloorPlan = async () => {
-      if (!canvas.value) return
-      ctx = canvas.value.getContext('2d')
-      if (!ctx) return
+    const selectFloorPlan = () => {
+      if (selectedFloorPlanIndex.value === -1) {
+        dxfData = null
+        markers.value = []
+        redrawCanvas()
+        setStatusMessage('Nenhuma planta baixa selecionada.')
+        return
+      }
 
-      redrawCanvas()
+      const plan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
+      if (!plan) {
+        setStatusMessage('Planta baixa inválida selecionada.', true)
+        return
+      }
+
+      console.log('Selecionando planta:', plan.name, 'Índice:', selectedFloorPlanIndex.value)
       try {
-        errorMessage.value = null
-        const response = await fetch('http://localhost:5000/api/markers')
-        if (response.ok) {
-          const data = await response.json()
-          markers.value = data.map((m: any) => ({
-            x: m.x,
-            y: m.y,
-            type: m.type,
-            color: deviceColors[m.type],
-            name: m.name,
-            ip: m.ip
-          }))
-          redrawCanvas()
-        } else {
-          errorMessage.value = 'Falha ao carregar marcadores do servidor'
-        }
+        const parser = new DxfParser()
+        dxfData = parser.parseSync(plan.content)
+        markers.value = plan.markers
+        resetView()
+        redrawCanvas()
+        setStatusMessage(`Planta baixa ${plan.name}${plan.id ? ` (ID: ${plan.id})` : ''} selecionada.`)
       } catch (error) {
-        console.error('Erro ao buscar marcadores:', error)
-        errorMessage.value = 'Não foi possível conectar ao servidor. Verifique se o backend está em execução em http://localhost:5000'
+        console.error('Erro ao processar planta baixa:', error)
+        setStatusMessage('Falha ao carregar a planta baixa selecionada.', true)
+        dxfData = null
+        markers.value = []
+        redrawCanvas()
       }
     }
 
-    const saveFloorPlan = async () => {
-      if (!currentDxfContent) {
-        errorMessage.value = 'Nenhum arquivo .dxf carregado para salvar'
+    watch(uploadedFloorPlans, (newValue) => {
+      console.log('uploadedFloorPlans atualizado:', newValue)
+    }, { deep: true })
+
+    watch(selectedFloorPlanIndex, (newValue) => {
+      console.log('selectedFloorPlanIndex alterado:', newValue)
+      selectFloorPlan()
+    })
+
+    const saveFloorPlanAs = async () => {
+      if (selectedFloorPlanIndex.value === -1) {
+        setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
+        return
+      }
+      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
+      if (!currentPlan.markers.length) {
+        setStatusMessage('Adicione pelo menos um marcador antes de salvar a planta baixa.', true)
         return
       }
 
       try {
-        errorMessage.value = null
+        setStatusMessage('Salvando nova planta baixa...')
         const response = await fetch('http://localhost:5000/api/floorplan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            dxfContent: currentDxfContent,
-            markers: markers.value.map(m => ({ x: m.x, y: m.y, type: m.type, name: m.name, ip: m.ip }))
+            dxfContent: currentPlan.content,
+            markers: currentPlan.markers
           })
         })
         if (response.ok) {
           const data = await response.json()
-          errorMessage.value = `Planta baixa salva com ID: ${data.id}`
+          uploadedFloorPlans.value[selectedFloorPlanIndex.value].id = data.id
+          setStatusMessage(`Nova planta baixa salva com ID: ${data.id}. Lista de plantas atualizada.`)
+          await fetchFloorPlans()
         } else {
-          throw new Error('Falha ao salvar a planta baixa')
+          throw new Error('Falha ao salvar a planta baixa.')
         }
       } catch (error) {
         console.error('Erro ao salvar planta baixa:', error)
-        errorMessage.value = 'Não foi possível salvar a planta baixa. Verifique se o backend está em execução em http://localhost:5000'
+        setStatusMessage('Não foi possível salvar a planta baixa. Verifique se o backend está ativo em http://localhost:5000.', true)
       }
     }
 
-    const loadFloorPlanFromServer = async () => {
-      const id = prompt('Digite o ID da planta baixa para carregar:')
-      if (!id) return
+    const updateFloorPlan = async () => {
+      if (selectedFloorPlanIndex.value === -1) {
+        setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
+        return
+      }
+      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
+      if (!currentPlan.markers.length) {
+        setStatusMessage('Adicione pelo menos um marcador antes de salvar a planta baixa.', true)
+        return
+      }
+      if (!currentPlan.id) {
+        setStatusMessage('Nenhuma ID associada à planta. Use "Salvar Como" para criar uma nova planta.', true)
+        return
+      }
 
       try {
-        errorMessage.value = null
+        setStatusMessage(`Atualizando planta baixa ID: ${currentPlan.id}...`)
+        const response = await fetch(`http://localhost:5000/api/floorplan/${currentPlan.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dxfContent: currentPlan.content,
+            markers: currentPlan.markers
+          })
+        })
+        if (response.ok) {
+          const data = await response.json()
+          setStatusMessage(`Planta baixa ID: ${data.id} atualizada com sucesso.`)
+          await fetchFloorPlans()
+        } else {
+          throw new Error('Falha ao atualizar a planta baixa.')
+        }
+      } catch (error) {
+        console.error('Erro ao atualizar planta baixa:', error)
+        setStatusMessage('Não foi possível atualizar a planta baixa. Verifique se o backend está ativo em http://localhost:5000.', true)
+      }
+    }
+
+    const saveFloorPlan = async () => {
+      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
+      if (currentPlan?.id) {
+        await updateFloorPlan()
+      } else {
+        await saveFloorPlanAs()
+      }
+    }
+
+    const fetchFloorPlans = async () => {
+      try {
+        setStatusMessage('Buscando plantas baixas...')
+        const response = await fetch('http://localhost:5000/api/floorplans')
+        if (response.ok) {
+          const data = await response.json()
+          floorPlans.value = [...data.floorPlans]
+          console.log('floorPlans atualizado:', floorPlans.value)
+          setStatusMessage('Plantas baixas carregadas com sucesso.')
+        } else {
+          throw new Error('Falha ao listar plantas baixas.')
+        }
+      } catch (error) {
+        console.error('Erro ao buscar plantas baixas:', error)
+        setStatusMessage('Não foi possível listar plantas baixas. Verifique se o backend está ativo em http://localhost:5000.', true)
+      }
+    }
+
+    const loadFloorPlanById = async (id: string) => {
+      try {
+        setStatusMessage(`Carregando planta baixa ID: ${id}...`)
         const response = await fetch(`http://localhost:5000/api/floorplan/${id}`)
         if (response.ok) {
           const data = await response.json()
-          currentDxfContent = data.dxfContent
           const parser = new DxfParser()
-          dxfData = await parser.parse(currentDxfContent)
-          markers.value = data.markers.map((m: any) => ({
-            x: m.x,
-            y: m.y,
-            type: m.type,
-            color: deviceColors[m.type],
-            name: m.name,
-            ip: m.ip
-          }))
+          dxfData = parser.parseSync(data.dxfContent)
+          const newPlan: FloorPlan = {
+            id,
+            name: `Planta Baixa ID ${id}`,
+            content: data.dxfContent,
+            markers: data.markers.map((m: any) => ({
+              x: m.x,
+              y: m.y,
+              type: m.type,
+              color: deviceColors[m.type] || 'gray',
+              name: m.name,
+              ip: m.ip
+            }))
+          }
+          uploadedFloorPlans.value = [...uploadedFloorPlans.value, newPlan]
+          selectedFloorPlanIndex.value = uploadedFloorPlans.value.length - 1
+          markers.value = newPlan.markers
           resetView()
-          await loadFloorPlan()
+          redrawCanvas()
+          showFloorPlanList.value = false
+          setStatusMessage(`Planta baixa ID: ${id} carregada com sucesso.`)
         } else {
-          throw new Error('Falha ao carregar a planta baixa')
+          throw new Error('Falha ao carregar a planta baixa.')
         }
       } catch (error) {
         console.error('Erro ao carregar planta baixa:', error)
-        errorMessage.value = 'Não foi possível carregar a planta baixa. Verifique o ID ou assegure-se de que o backend está em execução em http://localhost:5000'
+        setStatusMessage('Não foi possível carregar a planta baixa. Verifique o ID ou confirme se o backend está ativo em http://localhost:5000.', true)
       }
     }
 
@@ -243,7 +421,7 @@ export default defineComponent({
       link.href = dataUrl
       link.download = 'planta_baixa.png'
       link.click()
-      errorMessage.value = 'Planta baixa exportada como PNG'
+      setStatusMessage('Planta baixa exportada como PNG.')
     }
 
     const getDxfBounds = (dxf: any): Bounds => {
@@ -289,7 +467,7 @@ export default defineComponent({
       if (event.button === 0) {
         isPanning = false
         if (!isDragging && Math.hypot(mouseUpX - mouseDownX, mouseUpY - mouseDownY) < 5) {
-          placeMarker(event)
+          openMarkerModal(event)
         }
       }
     }
@@ -330,25 +508,31 @@ export default defineComponent({
       redrawCanvas()
     }
 
-    const placeMarker = async (event: MouseEvent) => {
+    const openMarkerModal = (event: MouseEvent) => {
       if (!canvas.value || !ctx) return
-
       const rect = canvas.value.getBoundingClientRect()
-      let x = (event.clientX - rect.left - panOffsetX) / (baseScale * zoomLevel)
-      let y = (event.clientY - rect.top - panOffsetY) / (baseScale * zoomLevel)
+      newMarkerX.value = (event.clientX - rect.left - panOffsetX) / (baseScale * zoomLevel)
+      newMarkerY.value = (event.clientY - rect.top - panOffsetY) / (baseScale * zoomLevel)
+      newMarkerName.value = ''
+      newMarkerIp.value = ''
+      showMarkerModal.value = true
+    }
 
-      x = Math.round(x / effectiveGridSize.value) * effectiveGridSize.value
-      y = Math.round(y / effectiveGridSize.value) * effectiveGridSize.value
-
-      const name = prompt('Digite o nome do equipamento:')?.trim()
-      if (!name) {
-        errorMessage.value = 'O nome do equipamento é obrigatório'
+    const confirmMarker = async () => {
+      if (!newMarkerName.value.trim()) {
+        setStatusMessage('O nome do equipamento é obrigatório.', true)
         return
       }
-      const ip = prompt('Digite o endereço IP:')?.trim()
-      if (!ip || !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(ip)) {
-        errorMessage.value = 'É necessário um endereço IP válido (por exemplo, 192.168.1.1)'
+      if (!newMarkerIp.value.trim() || !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(newMarkerIp.value)) {
+        setStatusMessage('É necessário um endereço IP válido (exemplo: 192.168.1.1).', true)
         return
+      }
+
+      let x = newMarkerX.value
+      let y = newMarkerY.value
+      if (showGrid.value) {
+        x = Math.round(x / effectiveGridSize.value) * effectiveGridSize.value
+        y = Math.round(y / effectiveGridSize.value) * effectiveGridSize.value
       }
 
       const newMarker: Marker = {
@@ -356,30 +540,41 @@ export default defineComponent({
         y,
         type: selectedDeviceType.value,
         color: deviceColors[selectedDeviceType.value],
-        name,
-        ip
+        name: newMarkerName.value,
+        ip: newMarkerIp.value
       }
-      markers.value.push(newMarker)
+
+      if (selectedFloorPlanIndex.value !== -1) {
+        uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers.push(newMarker)
+        markers.value = uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers
+      }
 
       try {
-        errorMessage.value = null
+        setStatusMessage('Salvando marcador...')
         const response = await fetch('http://localhost:5000/api/markers', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x, y, type: selectedDeviceType.value, name, ip })
+          body: JSON.stringify({ x, y, type: selectedDeviceType.value, name: newMarkerName.value, ip: newMarkerIp.value })
         })
         if (!response.ok) throw new Error('Failed to save marker')
+        setStatusMessage('Marcador adicionado com sucesso.')
       } catch (error) {
         console.error('Erro ao salvar marcador:', error)
-        errorMessage.value = 'Não foi possível salvar o marcador. Verifique se o backend está em execução em http://localhost:5000'
+        setStatusMessage('Não foi possível salvar o marcador. Verifique se o backend está ativo em http://localhost:5000.', true)
       }
 
+      showMarkerModal.value = false
       redrawCanvas()
+    }
+
+    const cancelMarker = () => {
+      showMarkerModal.value = false
+      newMarkerName.value = ''
+      newMarkerIp.value = ''
     }
 
     const removeMarker = (event: MouseEvent) => {
       if (!canvas.value || !ctx) return
-
       const rect = canvas.value.getBoundingClientRect()
       const x = (event.clientX - rect.left - panOffsetX) / (baseScale * zoomLevel)
       const y = (event.clientY - rect.top - panOffsetY) / (baseScale * zoomLevel)
@@ -393,20 +588,22 @@ export default defineComponent({
     }
 
     const removeMarkerByIndex = async (index: number) => {
-      if (index < 0 || index >= markers.value.length) return
+      if (index < 0 || index >= markers.value.length || selectedFloorPlanIndex.value === -1) return
 
       try {
-        errorMessage.value = null
+        setStatusMessage('Excluindo marcador...')
         const response = await fetch(`http://localhost:5000/api/markers/${index}`, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' }
         })
         if (!response.ok) throw new Error('Failed to delete marker')
-        markers.value.splice(index, 1)
+        uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers.splice(index, 1)
+        markers.value = uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers
+        setStatusMessage('Marcador excluído com sucesso.')
         redrawCanvas()
       } catch (error) {
         console.error('Erro ao excluir marcador:', error)
-        errorMessage.value = 'Não foi possível excluir o marcador. Verifique se o backend está em execução em http://localhost:5000'
+        setStatusMessage('Não foi possível excluir o marcador. Verifique se o backend está ativo em http://localhost:5000.', true)
       }
     }
 
@@ -589,33 +786,47 @@ export default defineComponent({
       ctx.restore()
     }
 
-    onMounted(() => {
+    onMounted(async () => {
       if (canvas.value) {
         ctx = canvas.value.getContext('2d')
       }
+      await fetchFloorPlans()
     })
 
     return {
       canvas,
       fileInput,
+      uploadedFloorPlans,
+      selectedFloorPlanIndex,
       markers,
       selectedDeviceType,
-      errorMessage,
+      statusMessage,
+      isError,
       tooltip,
       tooltipStyle,
       showGrid,
       baseGridSize,
       gridColor,
       gridStyle,
+      showMarkerModal,
+      newMarkerName,
+      newMarkerIp,
+      showFloorPlanList,
+      floorPlans,
       handleFileUpload,
-      loadFloorPlan,
+      selectFloorPlan,
       saveFloorPlan,
-      loadFloorPlanFromServer,
+      saveFloorPlanAs,
+      updateFloorPlan,
+      fetchFloorPlans,
+      loadFloorPlanById,
       exportCanvas,
       handleMouseDown,
       handleMouseUp,
       handleMouseMove,
-      placeMarker,
+      openMarkerModal,
+      confirmMarker,
+      cancelMarker,
       removeMarker,
       removeMarkerByIndex,
       toggleGrid,
@@ -639,6 +850,11 @@ select {
   margin: 10px 5px;
   padding: 5px;
   border-radius: 3px;
+  width: 200px;
+}
+select:disabled {
+  background-color: #e9ecef;
+  cursor: not-allowed;
 }
 button {
   margin: 10px 5px;
@@ -659,9 +875,18 @@ li button {
 li button:hover {
   background-color: #c82333;
 }
-.error {
-  color: red;
+.status {
   margin: 10px 0;
+  padding: 10px;
+  border-radius: 3px;
+}
+.status.error {
+  color: red;
+  background-color: #f8d7da;
+}
+.status:not(.error) {
+  color: green;
+  background-color: #d4edda;
 }
 .tooltip {
   z-index: 1000;
@@ -669,10 +894,63 @@ li button:hover {
 label {
   margin: 10px 5px;
 }
-input[type="number"] {
-  width: 60px;
+input[type="number"], input[type="text"] {
+  width: 100px;
   padding: 5px;
   border-radius: 3px;
   border: 1px solid #ccc;
+}
+.modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+.modal-content {
+  background: white;
+  padding: 20px;
+  border-radius: 5px;
+  max-width: 400px;
+  width: 100%;
+}
+.modal-content h3 {
+  margin-top: 0;
+}
+.modal-content label {
+  display: block;
+  margin: 10px 0;
+}
+.modal-content input {
+  width: 100%;
+  box-sizing: border-box;
+}
+.modal-actions {
+  margin-top: 20px;
+  text-align: right;
+}
+.modal-actions button {
+  margin-left: 10px;
+}
+.modal ul {
+  list-style: none;
+  padding: 0;
+}
+.modal li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 10px 0;
+}
+.modal li button {
+  background-color: #28a745;
+}
+.modal li button:hover {
+  background-color: #218838;
 }
 </style>
