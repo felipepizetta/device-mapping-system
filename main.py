@@ -1,71 +1,94 @@
+import json
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import uuid
-import os
+from uuid import uuid4
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "http://localhost:5173"}})
 
-# Simulação de armazenamento em memória
-floor_plans = {}
-markers = []
+# Arquivo para armazenamento persistente
+DATA_FILE = "floor_plans.json"
 
-@app.route('/api/markers', methods=['GET', 'POST'])
-def handle_markers():
-    if request.method == 'GET':
-        return jsonify(markers)
-    elif request.method == 'POST':
-        data = request.get_json()
-        if not data or 'x' not in data or 'y' not in data or 'type' not in data or 'name' not in data or 'ip' not in data:
-            return jsonify({'error': 'Dados de marcador inválidos'}), 400
-        marker = {
-            'x': data['x'],
-            'y': data['y'],
-            'type': data['type'],
-            'name': data['name'],
-            'ip': data['ip']
-        }
-        markers.append(marker)
-        return jsonify({'message': 'Marcador salvo com sucesso'}), 201
+# Inicializar arquivo JSON se não existir
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, 'w') as f:
+        json.dump({"floor_plans": []}, f)
 
-@app.route('/api/markers/<int:index>', methods=['DELETE'])
-def delete_marker(index):
-    if 0 <= index < len(markers):
-        markers.pop(index)
-        return jsonify({'message': 'Marcador excluído com sucesso'})
-    return jsonify({'error': 'Índice de marcador inválido'}), 404
+# Carregar planos do arquivo
+def load_floor_plans():
+    with open(DATA_FILE, 'r') as f:
+        return json.load(f)["floor_plans"]
 
-@app.route('/api/floorplan', methods=['POST'])
-def save_floor_plan():
+# Salvar planos no arquivo
+def save_floor_plans(floor_plans):
+    with open(DATA_FILE, 'w') as f:
+        json.dump({"floor_plans": floor_plans}, f)
+
+@app.route('/api/floorplan', methods=['POST', 'OPTIONS'])
+def create_floor_plan():
+    if request.method == 'OPTIONS':
+        print("Recebida requisição OPTIONS para /api/floorplan")
+        return jsonify({}), 200
+
     data = request.get_json()
-    if not data or 'dxfContent' not in data or 'markers' not in data:
-        return jsonify({'error': 'Dados da planta baixa inválidos'}), 400
-    floor_plan_id = str(uuid.uuid4())
-    floor_plans[floor_plan_id] = {
-        'dxfContent': data['dxfContent'],
-        'markers': data['markers']
+    if not data or not all(key in data for key in ['name', 'dxfContent', 'markers']):
+        return jsonify({"error": "name, dxfContent e markers são obrigatórios"}), 400
+    
+    floor_plans = load_floor_plans()
+    id = str(uuid4())
+    floor_plan = {
+        "id": id,
+        "name": data["name"],
+        "dxfContent": data["dxfContent"],
+        "markers": data["markers"]
     }
-    return jsonify({'message': 'Planta baixa salva com sucesso', 'id': floor_plan_id}), 201
+    floor_plans.append(floor_plan)
+    save_floor_plans(floor_plans)
+    
+    print(f"Planta salva: ID={id}, Nome={data['name']}")
+    return jsonify({"id": id}), 200
 
-@app.route('/api/floorplan/<floor_plan_id>', methods=['GET', 'PUT'])
-def handle_floor_plan(floor_plan_id):
-    if floor_plan_id not in floor_plans:
-        return jsonify({'error': 'Planta baixa não encontrada'}), 404
-    if request.method == 'GET':
-        return jsonify(floor_plans[floor_plan_id])
-    elif request.method == 'PUT':
-        data = request.get_json()
-        if not data or 'dxfContent' not in data or 'markers' not in data:
-            return jsonify({'error': 'Dados da planta baixa inválidos'}), 400
-        floor_plans[floor_plan_id] = {
-            'dxfContent': data['dxfContent'],
-            'markers': data['markers']
-        }
-        return jsonify({'message': 'Planta baixa atualizada com sucesso', 'id': floor_plan_id})
+@app.route('/api/floorplan/<id>', methods=['PUT', 'OPTIONS'])
+def update_floor_plan(id):
+    if request.method == 'OPTIONS':
+        print(f"Recebida requisição OPTIONS para /api/floorplan/{id}")
+        return jsonify({}), 200
+
+    data = request.get_json()
+    if not data or not all(key in data for key in ['name', 'dxfContent', 'markers']):
+        return jsonify({"error": "name, dxfContent e markers são obrigatórios"}), 400
+    
+    floor_plans = load_floor_plans()
+    for i, plan in enumerate(floor_plans):
+        if plan["id"] == id:
+            floor_plans[i] = {
+                "id": id,
+                "name": data["name"],
+                "dxfContent": data["dxfContent"],
+                "markers": data["markers"]
+            }
+            save_floor_plans(floor_plans)
+            print(f"Planta atualizada: ID={id}, Nome={data['name']}")
+            return jsonify({"id": id}), 200
+    
+    return jsonify({"error": "Planta não encontrada"}), 404
+
+@app.route('/api/floorplan/<id>', methods=['GET'])
+def get_floor_plan(id):
+    floor_plans = load_floor_plans()
+    for plan in floor_plans:
+        if plan["id"] == id:
+            print(f"Planta recuperada: ID={id}, Nome={plan['name']}")
+            return jsonify(plan), 200
+    
+    return jsonify({"error": "Planta não encontrada"}), 404
 
 @app.route('/api/floorplans', methods=['GET'])
 def list_floor_plans():
-    return jsonify({'floorPlans': list(floor_plans.keys())})
+    floor_plans = load_floor_plans()
+    print("Listando plantas baixas:", [{"id": plan["id"], "name": plan["name"]} for plan in floor_plans])
+    return jsonify({"floorPlans": [{"id": plan["id"], "name": plan["name"]} for plan in floor_plans]}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)

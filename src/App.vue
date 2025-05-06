@@ -3,10 +3,10 @@
     <h2>Área da Planta Baixa</h2>
     <div>
       <input type="file" accept=".dxf" @change="handleFileUpload" ref="fileInput" />
-      <select v-model="selectedFloorPlanIndex" @change="selectFloorPlan" :disabled="!uploadedFloorPlans.length">
+      <select v-model="selectedFloorPlanIndex" @change="confirmSelectFloorPlan" :disabled="!uploadedFloorPlans.length">
         <option v-if="!uploadedFloorPlans.length" disabled value="-1">Nenhuma planta carregada</option>
         <option v-for="(plan, index) in uploadedFloorPlans" :key="index" :value="index">
-          {{ plan.name }} {{ plan.id ? `(ID: ${plan.id})` : '' }}
+          {{ plan.name }} {{ plan.id ? `(ID: ${plan.id})` : '' }} {{ plan.isModified ? '*' : '' }}
         </option>
       </select>
       <select v-model="selectedDeviceType">
@@ -15,16 +15,16 @@
         <option value="Computador">Computador</option>
       </select>
       <button @click="saveFloorPlan">Salvar</button>
-      <button @click="saveFloorPlanAs">Salvar Como</button>
+      <button @click="openSaveAsModal">Salvar Como</button>
       <button @click="showFloorPlanList = true">Listar Plantas Baixas</button>
       <button @click="resetView">Restaurar Visualização</button>
       <button @click="toggleGrid">{{ showGrid ? 'Ocultar Grade' : 'Exibir Grade' }}</button>
       <button @click="toggleGridStyle">{{ gridStyle === 'dashed' ? 'Grade Contínua' : 'Grade Tracejada' }}</button>
       <button @click="exportCanvas">Exportar como PNG</button>
-      <label>Tamanho da Grade: 
+      <label>Tamanho da Grade:
         <input type="number" v-model.number="baseGridSize" min="10" max="100" step="10" />
       </label>
-      <label>Cor da Grade: 
+      <label>Cor da Grade:
         <input type="color" v-model="gridColor" />
       </label>
     </div>
@@ -34,12 +34,12 @@
     <div v-if="tooltip" class="tooltip" :style="tooltipStyle">
       {{ tooltip }}
     </div>
-    <canvas 
-      id="floor-plan-canvas" 
-      ref="canvas" 
-      width="800" 
-      height="600" 
-      style="border: 1px solid black;" 
+    <canvas
+      id="floor-plan-canvas"
+      ref="canvas"
+      width="800"
+      height="600"
+      style="border: 1px solid black;"
       @mousedown="handleMouseDown"
       @mousemove="handleMouseMove"
       @mouseup="handleMouseUp"
@@ -73,14 +73,28 @@
       </div>
     </div>
 
+    <!-- Modal para salvar como -->
+    <div v-if="showSaveAsModal" class="modal">
+      <div class="modal-content">
+        <h3>Salvar Planta Baixa Como</h3>
+        <label>Nome da Planta Baixa:
+          <input type="text" v-model="newPlanName" placeholder="Ex.: Planta do Escritório" />
+        </label>
+        <div class="modal-actions">
+          <button @click="saveFloorPlanAs">Salvar</button>
+          <button @click="showSaveAsModal = false">Cancelar</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Modal para listar plantas baixas salvas -->
     <div v-if="showFloorPlanList" class="modal">
       <div class="modal-content">
         <h3>Selecionar Planta Baixa Salva</h3>
         <ul v-if="floorPlans.length">
-          <li v-for="planId in floorPlans" :key="planId">
-            Planta Baixa ID: {{ planId }}
-            <button @click="loadFloorPlanById(planId)">Carregar</button>
+          <li v-for="plan in floorPlans" :key="plan.id">
+            {{ plan.name }} (ID: {{ plan.id }})
+            <button @click="loadFloorPlanById(plan.id)">Carregar</button>
           </li>
         </ul>
         <p v-else>Nenhuma planta baixa salva disponível.</p>
@@ -93,7 +107,7 @@
 </template>
 
 <script lang="ts">
-import { defineComponent, ref, onMounted, computed, watch } from 'vue'
+import { defineComponent, ref, onMounted, computed, reactive, watch } from 'vue'
 import DxfParser from 'dxf-parser'
 
 interface Marker {
@@ -110,6 +124,7 @@ interface FloorPlan {
   name: string
   content: string
   markers: Marker[]
+  isModified: boolean
 }
 
 interface Bounds {
@@ -122,9 +137,18 @@ interface Bounds {
 export default defineComponent({
   name: 'App',
   setup() {
+    // Constantes
+    const BACKEND_URL = 'http://localhost:5000'
+    const DEVICE_COLORS: { [key: string]: string } = {
+      'Ponto de Acesso': 'red',
+      'Switch': 'blue',
+      'Computador': 'green'
+    }
+
+    // Estado reativo
     const canvas = ref<HTMLCanvasElement | null>(null)
     const fileInput = ref<HTMLInputElement | null>(null)
-    const uploadedFloorPlans = ref<FloorPlan[]>([])
+    const uploadedFloorPlans = reactive<FloorPlan[]>([])
     const selectedFloorPlanIndex = ref(-1)
     const markers = ref<Marker[]>([])
     const selectedDeviceType = ref('Ponto de Acesso')
@@ -143,29 +167,26 @@ export default defineComponent({
     const newMarkerX = ref(0)
     const newMarkerY = ref(0)
     const showFloorPlanList = ref(false)
-    const floorPlans = ref<string[]>([])
+    const showSaveAsModal = ref(false)
+    const newPlanName = ref('')
+    const floorPlans = ref<{ id: string; name: string }[]>([])
     let ctx: CanvasRenderingContext2D | null = null
     let dxfData: any = null
-    let baseScale: number = 1
-    let offsetX: number = 0
-    let offsetY: number = 0
-    let zoomLevel: number = 1
-    let panOffsetX: number = 0
-    let panOffsetY: number = 0
-    let isPanning: boolean = false
-    let startPanX: number = 0
-    let startPanY: number = 0
-    let isDragging: boolean = false
-    let mouseDownX: number = 0
-    let mouseDownY: number = 0
+    let baseScale = 1
+    let offsetX = 0
+    let offsetY = 0
+    let zoomLevel = 1
+    let panOffsetX = 0
+    let panOffsetY = 0
+    let isPanning = false
+    let startPanX = 0
+    let startPanY = 0
+    let isDragging = false
+    let mouseDownX = 0
+    let mouseDownY = 0
     let hoverGridPoint: { x: number; y: number } | null = null
 
-    const deviceColors: { [key: string]: string } = {
-      'Ponto de Acesso': 'red',
-      'Switch': 'blue',
-      'Computador': 'green'
-    }
-
+    // Computados
     const effectiveGridSize = computed(() => {
       const factor = Math.max(0.5, Math.min(2, 1 / zoomLevel))
       return baseGridSize.value * factor
@@ -182,15 +203,27 @@ export default defineComponent({
       pointerEvents: 'none'
     }))
 
-    const setStatusMessage = (message: string, error: boolean = false) => {
+    const currentPlan = computed(() => {
+      return selectedFloorPlanIndex.value !== -1 ? uploadedFloorPlans[selectedFloorPlanIndex.value] : null
+    })
+
+    // Funções utilitárias
+    const setStatusMessage = (message: string, error = false) => {
       statusMessage.value = message
       isError.value = error
       setTimeout(() => {
         statusMessage.value = null
         isError.value = false
-      }, 5000)
+      }, 10000) // Aumentado para 10 segundos
     }
 
+    const markPlanAsModified = () => {
+      if (selectedFloorPlanIndex.value !== -1) {
+        uploadedFloorPlans[selectedFloorPlanIndex.value].isModified = true
+      }
+    }
+
+    // Manipulação de arquivo DXF
     const handleFileUpload = async (event: Event) => {
       const target = event.target as HTMLInputElement
       const file = target.files?.[0]
@@ -213,13 +246,13 @@ export default defineComponent({
           const parsedData = parser.parseSync(content)
           console.log('Arquivo DXF carregado:', file.name, 'Tamanho:', content.length)
 
-          const newPlan: FloorPlan = { name: file.name, content, markers: [] }
-          uploadedFloorPlans.value = [...uploadedFloorPlans.value, newPlan]
-          selectedFloorPlanIndex.value = uploadedFloorPlans.value.length - 1
+          const newPlan: FloorPlan = { name: file.name, content, markers: [], isModified: false }
+          uploadedFloorPlans.push(newPlan)
+          selectedFloorPlanIndex.value = uploadedFloorPlans.length - 1
           dxfData = parsedData
           markers.value = newPlan.markers
 
-          console.log('uploadedFloorPlans:', uploadedFloorPlans.value)
+          console.log('uploadedFloorPlans:', uploadedFloorPlans.map(p => ({ name: p.name, id: p.id })))
           console.log('selectedFloorPlanIndex:', selectedFloorPlanIndex.value)
           setStatusMessage(`Arquivo ${file.name} carregado com sucesso.`)
           resetView()
@@ -236,6 +269,17 @@ export default defineComponent({
       if (fileInput.value) fileInput.value = ''
     }
 
+    // Seleção de planta
+    const confirmSelectFloorPlan = () => {
+      if (currentPlan.value?.isModified) {
+        if (!confirm('Alterações não salvas na planta atual serão perdidas. Deseja continuar?')) {
+          selectedFloorPlanIndex.value = uploadedFloorPlans.findIndex(p => p === currentPlan.value)
+          return
+        }
+      }
+      selectFloorPlan()
+    }
+
     const selectFloorPlan = () => {
       if (selectedFloorPlanIndex.value === -1) {
         dxfData = null
@@ -245,13 +289,13 @@ export default defineComponent({
         return
       }
 
-      const plan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
+      const plan = uploadedFloorPlans[selectedFloorPlanIndex.value]
       if (!plan) {
         setStatusMessage('Planta baixa inválida selecionada.', true)
         return
       }
 
-      console.log('Selecionando planta:', plan.name, 'Índice:', selectedFloorPlanIndex.value)
+      console.log('Selecionando planta:', plan.name, 'Índice:', selectedFloorPlanIndex.value, 'ID:', plan.id || 'Nenhum')
       try {
         const parser = new DxfParser()
         dxfData = parser.parseSync(plan.content)
@@ -268,162 +312,207 @@ export default defineComponent({
       }
     }
 
-    watch(uploadedFloorPlans, (newValue) => {
-      console.log('uploadedFloorPlans atualizado:', newValue)
-    }, { deep: true })
-
-    watch(selectedFloorPlanIndex, (newValue) => {
-      console.log('selectedFloorPlanIndex alterado:', newValue)
-      selectFloorPlan()
-    })
-
-    const saveFloorPlanAs = async () => {
-      if (selectedFloorPlanIndex.value === -1) {
+    // Salvamento
+    const openSaveAsModal = () => {
+      if (!currentPlan.value) {
         setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
         return
       }
-      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
-      if (!currentPlan.markers.length) {
+      newPlanName.value = currentPlan.value.name
+      showSaveAsModal.value = true
+    }
+
+    const saveFloorPlanAs = async () => {
+      if (!currentPlan.value) {
+        setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
+        showSaveAsModal.value = false
+        return
+      }
+      if (!currentPlan.value.markers.length) {
         setStatusMessage('Adicione pelo menos um marcador antes de salvar a planta baixa.', true)
+        showSaveAsModal.value = false
+        return
+      }
+      if (!newPlanName.value.trim()) {
+        setStatusMessage('O nome da planta baixa é obrigatório.', true)
         return
       }
 
       try {
-        setStatusMessage('Salvando nova planta baixa...')
-        const response = await fetch('http://localhost:5000/api/floorplan', {
+        setStatusMessage(`Salvando nova planta baixa: ${newPlanName.value}...`)
+        console.log('Enviando POST /api/floorplan:', { name: newPlanName.value, markersCount: currentPlan.value.markers.length })
+        const response = await fetch(`${BACKEND_URL}/api/floorplan`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            dxfContent: currentPlan.content,
-            markers: currentPlan.markers
+            name: newPlanName.value,
+            dxfContent: currentPlan.value.content,
+            markers: currentPlan.value.markers
           })
         })
         if (response.ok) {
           const data = await response.json()
-          uploadedFloorPlans.value[selectedFloorPlanIndex.value].id = data.id
-          setStatusMessage(`Nova planta baixa salva com ID: ${data.id}. Lista de plantas atualizada.`)
+          uploadedFloorPlans[selectedFloorPlanIndex.value].id = data.id
+          uploadedFloorPlans[selectedFloorPlanIndex.value].name = newPlanName.value
+          uploadedFloorPlans[selectedFloorPlanIndex.value].isModified = false
+          setStatusMessage(`Planta baixa ${newPlanName.value} salva com ID: ${data.id}.`)
+          console.log('Planta salva:', { id: data.id, name: newPlanName.value })
           await fetchFloorPlans()
+          showSaveAsModal.value = false
+          newPlanName.value = ''
         } else {
-          throw new Error('Falha ao salvar a planta baixa.')
+          const errorData = await response.json()
+          throw new Error(errorData.error || 'Falha ao salvar a planta baixa.')
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('Erro ao salvar planta baixa:', error)
-        setStatusMessage('Não foi possível salvar a planta baixa. Verifique se o backend está ativo em http://localhost:5000.', true)
+        const message = error.message.includes('Failed to fetch')
+          ? 'Não foi possível conectar ao servidor. Verifique se o backend está ativo e CORS está configurado.'
+          : `Erro ao salvar planta baixa: ${error.message}`
+        setStatusMessage(message, true)
       }
     }
 
     const updateFloorPlan = async () => {
-      if (selectedFloorPlanIndex.value === -1) {
+      if (!currentPlan.value) {
         setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
         return
       }
-      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
-      if (!currentPlan.markers.length) {
+      if (!currentPlan.value.markers.length) {
         setStatusMessage('Adicione pelo menos um marcador antes de salvar a planta baixa.', true)
         return
       }
-      if (!currentPlan.id) {
-        setStatusMessage('Nenhuma ID associada à planta. Use "Salvar Como" para criar uma nova planta.', true)
+      if (!currentPlan.value.id) {
+        setStatusMessage('Nenhuma ID associada. Use "Salvar Como" para criar uma nova planta.', true)
         return
       }
 
       try {
-        setStatusMessage(`Atualizando planta baixa ID: ${currentPlan.id}...`)
-        const response = await fetch(`http://localhost:5000/api/floorplan/${currentPlan.id}`, {
+        setStatusMessage(`Atualizando planta baixa ID: ${currentPlan.value.id}...`)
+        console.log('Enviando PUT /api/floorplan/', currentPlan.value.id)
+        const response = await fetch(`${BACKEND_URL}/api/floorplan/${currentPlan.value.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            dxfContent: currentPlan.content,
-            markers: currentPlan.markers
+            name: currentPlan.value.name,
+            dxfContent: currentPlan.value.content,
+            markers: currentPlan.value.markers
           })
         })
         if (response.ok) {
           const data = await response.json()
-          setStatusMessage(`Planta baixa ID: ${data.id} atualizada com sucesso.`)
+          uploadedFloorPlans[selectedFloorPlanIndex.value].isModified = false
+          setStatusMessage(`Planta baixa ${currentPlan.value.name} atualizada com sucesso.`)
+          console.log('Planta atualizada:', { id: data.id, name: currentPlan.value.name })
           await fetchFloorPlans()
         } else {
-          throw new Error('Falha ao atualizar a planta baixa.')
+          const errorData = await response.json()
+          throw new Error(errorData.error || 'Falha ao atualizar a planta baixa.')
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('Erro ao atualizar planta baixa:', error)
-        setStatusMessage('Não foi possível atualizar a planta baixa. Verifique se o backend está ativo em http://localhost:5000.', true)
+        const message = error.message.includes('Failed to fetch')
+          ? 'Não foi possível conectar ao servidor. Verifique se o backend está ativo e CORS está configurado.'
+          : `Erro ao atualizar planta baixa: ${error.message}`
+        setStatusMessage(message, true)
       }
     }
 
     const saveFloorPlan = async () => {
-      const currentPlan = uploadedFloorPlans.value[selectedFloorPlanIndex.value]
-      if (currentPlan?.id) {
+      if (!currentPlan.value) {
+        setStatusMessage('Nenhum arquivo .dxf carregado para salvar.', true)
+        return
+      }
+      if (currentPlan.value.id) {
         await updateFloorPlan()
       } else {
-        await saveFloorPlanAs()
+        openSaveAsModal()
       }
     }
 
+    // Carregamento de plantas salvas
     const fetchFloorPlans = async () => {
       try {
         setStatusMessage('Buscando plantas baixas...')
-        const response = await fetch('http://localhost:5000/api/floorplans')
+        const response = await fetch(`${BACKEND_URL}/api/floorplans`)
         if (response.ok) {
           const data = await response.json()
-          floorPlans.value = [...data.floorPlans]
+          floorPlans.value = data.floorPlans
           console.log('floorPlans atualizado:', floorPlans.value)
           setStatusMessage('Plantas baixas carregadas com sucesso.')
         } else {
-          throw new Error('Falha ao listar plantas baixas.')
+          const errorData = await response.json()
+          throw new Error(errorData.error || 'Falha ao listar plantas baixas.')
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('Erro ao buscar plantas baixas:', error)
-        setStatusMessage('Não foi possível listar plantas baixas. Verifique se o backend está ativo em http://localhost:5000.', true)
+        const message = error.message.includes('Failed to fetch')
+          ? 'Não foi possível conectar ao servidor. Verifique se o backend está ativo e CORS está configurado.'
+          : `Erro ao listar plantas baixas: ${error.message}`
+        setStatusMessage(message, true)
       }
     }
 
     const loadFloorPlanById = async (id: string) => {
+      if (currentPlan.value?.isModified) {
+        if (!confirm('Alterações não salvas na planta atual serão perdidas. Deseja continuar?')) {
+          return
+        }
+      }
+
       try {
         setStatusMessage(`Carregando planta baixa ID: ${id}...`)
-        const response = await fetch(`http://localhost:5000/api/floorplan/${id}`)
+        const response = await fetch(`${BACKEND_URL}/api/floorplan/${id}`)
         if (response.ok) {
           const data = await response.json()
           const parser = new DxfParser()
           dxfData = parser.parseSync(data.dxfContent)
           const newPlan: FloorPlan = {
             id,
-            name: `Planta Baixa ID ${id}`,
+            name: data.name,
             content: data.dxfContent,
             markers: data.markers.map((m: any) => ({
               x: m.x,
               y: m.y,
               type: m.type,
-              color: deviceColors[m.type] || 'gray',
+              color: DEVICE_COLORS[m.type] || 'gray',
               name: m.name,
               ip: m.ip
-            }))
+            })),
+            isModified: false
           }
-          uploadedFloorPlans.value = [...uploadedFloorPlans.value, newPlan]
-          selectedFloorPlanIndex.value = uploadedFloorPlans.value.length - 1
+          uploadedFloorPlans.push(newPlan)
+          selectedFloorPlanIndex.value = uploadedFloorPlans.length - 1
           markers.value = newPlan.markers
           resetView()
           redrawCanvas()
           showFloorPlanList.value = false
-          setStatusMessage(`Planta baixa ID: ${id} carregada com sucesso.`)
+          setStatusMessage(`Planta baixa ${data.name} carregada com sucesso.`)
         } else {
-          throw new Error('Falha ao carregar a planta baixa.')
+          const errorData = await response.json()
+          throw new Error(errorData.error || 'Falha ao carregar a planta baixa.')
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('Erro ao carregar planta baixa:', error)
-        setStatusMessage('Não foi possível carregar a planta baixa. Verifique o ID ou confirme se o backend está ativo em http://localhost:5000.', true)
+        const message = error.message.includes('Failed to fetch')
+          ? 'Não foi possível conectar ao servidor. Verifique se o backend está ativo e CORS está configurado.'
+          : `Erro ao carregar planta baixa: ${error.message}`
+        setStatusMessage(message, true)
       }
     }
 
+    // Exportação
     const exportCanvas = () => {
       if (!canvas.value) return
       const dataUrl = canvas.value.toDataURL('image/png')
       const link = document.createElement('a')
       link.href = dataUrl
-      link.download = 'planta_baixa.png'
+      link.download = currentPlan.value ? `${currentPlan.value.name}.png` : 'Planta baixa.png'
       link.click()
       setStatusMessage('Planta baixa exportada como PNG.')
     }
 
+    // Manipulação do canvas
     const getDxfBounds = (dxf: any): Bounds => {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       dxf.entities.forEach((entity: any) => {
@@ -518,7 +607,7 @@ export default defineComponent({
       showMarkerModal.value = true
     }
 
-    const confirmMarker = async () => {
+    const confirmMarker = () => {
       if (!newMarkerName.value.trim()) {
         setStatusMessage('O nome do equipamento é obrigatório.', true)
         return
@@ -539,28 +628,19 @@ export default defineComponent({
         x,
         y,
         type: selectedDeviceType.value,
-        color: deviceColors[selectedDeviceType.value],
+        color: DEVICE_COLORS[selectedDeviceType.value],
         name: newMarkerName.value,
         ip: newMarkerIp.value
       }
 
       if (selectedFloorPlanIndex.value !== -1) {
-        uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers.push(newMarker)
-        markers.value = uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers
-      }
-
-      try {
-        setStatusMessage('Salvando marcador...')
-        const response = await fetch('http://localhost:5000/api/markers', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x, y, type: selectedDeviceType.value, name: newMarkerName.value, ip: newMarkerIp.value })
-        })
-        if (!response.ok) throw new Error('Failed to save marker')
-        setStatusMessage('Marcador adicionado com sucesso.')
-      } catch (error) {
-        console.error('Erro ao salvar marcador:', error)
-        setStatusMessage('Não foi possível salvar o marcador. Verifique se o backend está ativo em http://localhost:5000.', true)
+        uploadedFloorPlans[selectedFloorPlanIndex.value].markers.push(newMarker)
+        markers.value = uploadedFloorPlans[selectedFloorPlanIndex.value].markers
+        markPlanAsModified()
+        console.log('Marcador adicionado localmente:', newMarker)
+        setStatusMessage(`Marcador ${newMarker.name} adicionado à ${currentPlan.value?.name}.`)
+      } else {
+        setStatusMessage('Nenhuma planta selecionada para adicionar o marcador.', true)
       }
 
       showMarkerModal.value = false
@@ -587,24 +667,16 @@ export default defineComponent({
       }
     }
 
-    const removeMarkerByIndex = async (index: number) => {
+    const removeMarkerByIndex = (index: number) => {
       if (index < 0 || index >= markers.value.length || selectedFloorPlanIndex.value === -1) return
 
-      try {
-        setStatusMessage('Excluindo marcador...')
-        const response = await fetch(`http://localhost:5000/api/markers/${index}`, {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' }
-        })
-        if (!response.ok) throw new Error('Failed to delete marker')
-        uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers.splice(index, 1)
-        markers.value = uploadedFloorPlans.value[selectedFloorPlanIndex.value].markers
-        setStatusMessage('Marcador excluído com sucesso.')
-        redrawCanvas()
-      } catch (error) {
-        console.error('Erro ao excluir marcador:', error)
-        setStatusMessage('Não foi possível excluir o marcador. Verifique se o backend está ativo em http://localhost:5000.', true)
-      }
+      const markerName = uploadedFloorPlans[selectedFloorPlanIndex.value].markers[index].name
+      uploadedFloorPlans[selectedFloorPlanIndex.value].markers.splice(index, 1)
+      markers.value = uploadedFloorPlans[selectedFloorPlanIndex.value].markers
+      markPlanAsModified()
+      console.log('Marcador removido localmente:', { index, name: markerName })
+      setStatusMessage(`Marcador ${markerName} removido de ${currentPlan.value?.name}.`)
+      redrawCanvas()
     }
 
     const toggleGrid = () => {
@@ -786,12 +858,18 @@ export default defineComponent({
       ctx.restore()
     }
 
+    // Inicialização
     onMounted(async () => {
       if (canvas.value) {
         ctx = canvas.value.getContext('2d')
       }
       await fetchFloorPlans()
     })
+
+    // Monitoramento de alterações
+    watch(uploadedFloorPlans, (newValue) => {
+      console.log('uploadedFloorPlans atualizado:', newValue.map(p => ({ name: p.name, id: p.id, markers: p.markers.length, isModified: p.isModified })))
+    }, { deep: true })
 
     return {
       canvas,
@@ -812,11 +890,14 @@ export default defineComponent({
       newMarkerName,
       newMarkerIp,
       showFloorPlanList,
+      showSaveAsModal,
+      newPlanName,
       floorPlans,
       handleFileUpload,
-      selectFloorPlan,
+      confirmSelectFloorPlan,
       saveFloorPlan,
       saveFloorPlanAs,
+      openSaveAsModal,
       updateFloorPlan,
       fetchFloorPlans,
       loadFloorPlanById,
